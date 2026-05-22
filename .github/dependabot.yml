@@ -1,0 +1,38 @@
+version: 2
+updates:
+- package-ecosystem: github-actions
+  directory: "/"
+  schedule:
+    interval: daily
+- package-ecosystem: rust-toolchain
+  directory: "/"
+  schedule:
+    interval: daily
+- package-ecosystem: cargo
+  directory: "/versions/latest"
+  allow:
+  - dependency-name: "wasmtime-cli"
+  schedule:
+    interval: daily
+- package-ecosystem: cargo
+  directory: "/versions/latest-1"
+  allow:
+  - dependency-name: "wasmtime-cli"
+    update-types: ["version-update:semver-patch", "version-update:semver-minor"]
+  schedule:
+    interval: daily
+- package-ecosystem: cargo
+  directory: "/versions/lts"
+  allow:
+  - dependency-name: "wasmtime-cli"
+    update-types: ["version-update:semver-patch", "version-update:semver-minor"]
+  schedule:
+    interval: daily
+- package-ecosystem: cargo
+  directory: "/versions/lts-1"
+  allow:
+  - dependency-name: "wasmtime-cli"
+    update-types: ["version-update:semver-patch", "version-update:semver-minor"]
+  schedule:
+    interval: daily
+

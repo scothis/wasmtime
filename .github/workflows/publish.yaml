@@ -1,0 +1,206 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs: &workflow-inputs
+      wasmtime-version:
+        description: wasmtime version to build
+        required: true
+        type: string
+      rust-version:
+        description: rust version to build
+        required: true
+        type: string
+      publish:
+        description: publish built image
+        required: true
+        type: boolean
+      force:
+        description: force overwriting an existing image
+        required: true
+        type: boolean
+      concurrency-group:
+        description: run a single workflow at a time for workflows with the same group
+        type: string
+      additional-tags:
+        description: new line delimited set of additional tag to add to the published image
+        type: string
+  workflow_call:
+    inputs: *workflow-inputs
+
+concurrency:
+  group: ${{ inputs.concurrency-group }}
+  queue: max
+
+jobs:
+
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      existing-digest: ${{ steps.existing.outputs.digest }}
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install crane
+      uses: reconcilerio/install-crane-action@v1
+    - name: Check for existing image
+      id: existing
+      run: |
+        digest="$(crane digest "ghcr.io/${{ github.repository }}:v${{ inputs.wasmtime-version }}" || echo -n '')"
+        echo "digest=${digest}" | tee -a "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build wasmtime image
+    needs: preflight
+    if: ${{ inputs.force || ! needs.preflight.outputs.existing-digest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-24.04
+          arch: amd64
+        - os: ubuntu-24.04-arm
+          arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+    - name: Build
+      run: |
+        set -euo pipefail
+
+        docker buildx create \
+          --name container \
+          --driver=docker-container \
+          default
+
+        docker buildx build \
+          --builder container \
+          --output type=oci,dest="./wasmtime-v${{ inputs.wasmtime-version }}-${{ matrix.arch }}.tar" \
+          --platform "linux/${{ matrix.arch }}" \
+          --build-arg "rust=${{ inputs.rust-version }}" \
+          --build-arg "wasmtime=${{ inputs.wasmtime-version }}" \
+          --provenance false \
+          --sbom=false \
+          .
+
+        mkdir "wasmtime-v${{ inputs.wasmtime-version }}-${{ matrix.arch }}"
+        tar -xvf "wasmtime-v${{ inputs.wasmtime-version }}-${{ matrix.arch }}.tar" -C "wasmtime-v${{ inputs.wasmtime-version }}-${{ matrix.arch }}"
+    - uses: actions/upload-artifact@v7
+      with:
+        name: "wasmtime-v${{ inputs.wasmtime-version }}-${{ matrix.arch }}"
+        path: "wasmtime-v${{ inputs.wasmtime-version }}-${{ matrix.arch }}"
+        retention-days: 7
+
+  assemble:
+    name: Assemble image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install crane
+      uses: reconcilerio/install-crane-action@v1
+    - name: OCI registry
+      uses: reconcilerio/registry@v1
+    - name: Download staged image (amd64)
+      uses: actions/download-artifact@v8
+      with:
+        name: "wasmtime-v${{ inputs.wasmtime-version }}-amd64"
+        path: "wasmtime-v${{ inputs.wasmtime-version }}-amd64"
+    - name: Download staged image (arm64)
+      uses: actions/download-artifact@v8
+      with:
+        name: "wasmtime-v${{ inputs.wasmtime-version }}-arm64"
+        path: "wasmtime-v${{ inputs.wasmtime-version }}-arm64"
+    - name: Assemble
+      run: |
+        set -euo pipefail
+
+        crane push --index \
+          "wasmtime-v${{ inputs.wasmtime-version }}-amd64" \
+          registry.local/wasmtime:amd64
+
+        crane push --index \
+          "wasmtime-v${{ inputs.wasmtime-version }}-arm64" \
+          registry.local/wasmtime:arm64
+
+        crane index append \
+          -m registry.local/wasmtime:amd64 \
+          -m registry.local/wasmtime:arm64 \
+          -t registry.local/wasmtime
+
+        crane pull --format oci \
+          registry.local/wasmtime \
+          "wasmtime-v${{ inputs.wasmtime-version }}"
+    - uses: actions/upload-artifact@v7
+      with:
+        name: "wasmtime-v${{ inputs.wasmtime-version }}"
+        path: "wasmtime-v${{ inputs.wasmtime-version }}"
+        retention-days: 7
+
+  test:
+    name: Test wasmtime image
+    needs: assemble
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-24.04
+        - os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install crane
+      uses: reconcilerio/install-crane-action@v1
+    - name: OCI registry
+      uses: reconcilerio/registry@v1
+    - name: Download staged image
+      uses: actions/download-artifact@v8
+      with:
+        name: "wasmtime-v${{ inputs.wasmtime-version }}"
+        path: "wasmtime-v${{ inputs.wasmtime-version }}"
+    - name: Relocate image
+      run: |
+        crane push --index "wasmtime-v${{ inputs.wasmtime-version }}" registry.local/wasmtime
+    # TODO test image
+    - run: docker run --rm registry.local/wasmtime wasmtime --version
+
+  publish:
+    name: Publish wasmtime image
+    needs: test
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install crane
+      uses: reconcilerio/install-crane-action@v1
+    - name: Download staged image
+      uses: actions/download-artifact@v8
+      with:
+        name: "wasmtime-v${{ inputs.wasmtime-version }}"
+        path: "wasmtime-v${{ inputs.wasmtime-version }}"
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Publish
+      run: |
+        crane push --index \
+          "wasmtime-v${{ inputs.wasmtime-version }}" \
+          "ghcr.io/${{ github.repository }}:v${{ inputs.wasmtime-version }}"
+    - name: Additional tags
+      if: inputs.additional-tags
+      run: |
+        set -euo pipefail
+
+        additional_tags="$(echo "${{ inputs.additional-tags }}" | awk '{$1=$1};1' | grep -v -e "^$")"
+
+        while IFS= read -r tag; do
+          crane tag \
+            "ghcr.io/${{ github.repository }}:v${{ inputs.wasmtime-version }}" \
+            "${tag}"
+        done <<< "${additional_tags}"
